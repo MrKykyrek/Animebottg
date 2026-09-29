@@ -49,7 +49,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+bot = Bot(token=7913797895:AAGgdA0ExqTMZJJHLSbneIdOrJYnOTFMv8w) if BOT_TOKEN else None
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
