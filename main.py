@@ -3,16 +3,17 @@ Telegram-бот расписания СибУПК.
 Парсит http://old.sibupk.su/services/shedule_new/index.php?mode=1
 
 Установка:
-    pip install aiogram beautifulsoup4 aiohttp apscheduler
+    pip install aiogram beautifulsoup4 aiohttp apscheduler python-dotenv
 
 Запуск:
-    python bot.py
+    python main.py           # обычный запуск
+    python main.py --test    # самопроверка парсера без Telegram
 """
 
 import asyncio
 import logging
-import re
-from datetime import datetime, timedelta
+import sys
+from datetime import datetime
 
 import aiohttp
 from aiogram import Bot, Dispatcher
@@ -20,22 +21,26 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+import os
 
 # ==================== КОНФИГ ====================
-BOT_TOKEN = "8387547147:AAGki73PH8mEYt0c_KQoo3BmKidID1b1emg"
-CHAT_ID = 0                    # ID чата/канала, куда слать авто-расписание
+load_dotenv()
 
-# Параметры группы — как на сайте
-ID_FORMA = "1"                 # 1 = очная
-ID_FAK = "1"                   # 1 = Торгово-технологический факультет
-KURS = "1"                     # 1 курс
-GROUP_NAME = "ПК-61 (Поварское и кондитерское дело)"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+
+ID_FORMA = os.getenv("ID_FORMA", "1")
+ID_FAK = os.getenv("ID_FAK", "1")
+KURS = os.getenv("KURS", "1")
+GROUP_NAME = os.getenv("GROUP_NAME", "ПК-61 (Поварское и кондитерское дело)")
 
 URL = "http://old.sibupk.su/services/shedule_new/index.php?mode=1"
 
-PARSE_HOUR = 7                 # во сколько отправлять авто-расписание
-PARSE_MINUTE = 30
-TIMEZONE = "Asia/Novosibirsk"  # СибУПК в Новосибирске
+PARSE_HOUR = int(os.getenv("PARSE_HOUR", "7"))
+PARSE_MINUTE = int(os.getenv("PARSE_MINUTE", "30"))
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Novosibirsk")
 # ================================================
 
 
@@ -44,22 +49,12 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 
 # ==================== ХЕЛПЕРЫ ====================
-def get_current_range() -> str:
-    """Возвращает интервал 2 недель, в который попадает сегодня."""
-    today = datetime.now().date()
-    # Ориентируемся на ближайший понедельник и берём текущую пару недель
-    # На сайте интервалы заданы вручную, но мы можем запросить ближайший
-    # Для простоты — берём список из формы и находим подходящий
-    # Здесь упрощённо: возвращаем текущий интервал, который найдём парсингом формы
-    return ""  # будет подставлено динамически
-
-
 async def fetch_ranges(session: aiohttp.ClientSession) -> list[str]:
     """Получает список доступных интервалов с сайта."""
     data = {
@@ -69,7 +64,7 @@ async def fetch_ranges(session: aiohttp.ClientSession) -> list[str]:
         "NamePodGrup": GROUP_NAME,
         "RangeNedel": "",
     }
-    async with session.post(URL, data=data) as resp:
+    async with session.post(URL, data=data, timeout=20) as resp:
         html = await resp.text()
     soup = BeautifulSoup(html, "html.parser")
     ranges = []
@@ -92,7 +87,6 @@ def pick_current_range(ranges: list[str]) -> str:
                 return r
         except ValueError:
             continue
-    # если сегодня вне интервалов — берём ближайший будущий
     future = []
     for r in ranges:
         try:
@@ -131,45 +125,33 @@ async def fetch_schedule_html(range_nedel: str) -> str:
             return await resp.text()
 
 
-# ==================== ПАРСЕР РАСПИСАНИЯ ====================
+# ==================== ПАРСЕР ====================
 def parse_schedule_html(html: str) -> str:
-    """Превращает HTML с расписанием в красивый текст для Telegram."""
     soup = BeautifulSoup(html, "html.parser")
-
-    # Находим таблицу расписания — она с class="table"
     table = soup.find("table", class_="table")
     if not table:
         return "⚠️ Таблица расписания не найдена."
 
     out_lines: list[str] = []
-    current_week = None
-    current_day = None
-
     for row in table.find_all("tr"):
-        # Заголовок недели: <th colspan="5">НЕЧЕТНАЯ НЕДЕЛЯ</th>
         th = row.find("th", colspan="5")
         if th:
             text = th.get_text(" ", strip=True)
             if "НЕДЕЛЯ" in text.upper() and "№ Пары" not in text:
-                current_week = text
-                out_lines.append(f"\n━━━ {current_week} ━━━")
+                out_lines.append(f"\n━━━ {text} ━━━")
             elif "(" in text and ")" in text and "№" not in text:
-                current_day = text
-                out_lines.append(f"\n📅 {current_day}")
+                out_lines.append(f"\n📅 {text}")
             continue
 
-        # Обычная строка с парой
         tds = row.find_all("td")
         if len(tds) < 5:
             continue
 
         num_time = tds[0].get_text(" ", strip=True)
         subject = tds[1].get_text(" ", strip=True)
-        _stream = tds[2].get_text(" ", strip=True)
         room = tds[3].get_text(" ", strip=True)
         teacher = tds[4].get_text(" ", strip=True)
 
-        # Сокращаем "(лек)", "(лаб)", "(с)" и т.п. — оставляем
         out_lines.append(
             f"  {num_time}\n"
             f"  📚 {subject}\n"
@@ -182,9 +164,8 @@ def parse_schedule_html(html: str) -> str:
     return "\n".join(out_lines).strip()
 
 
-# ==================== ОТПРАВКА ====================
+# ==================== СБОРКА СООБЩЕНИЯ ====================
 async def build_schedule_message() -> str:
-    """Собирает полный текст расписания для текущей недели."""
     async with aiohttp.ClientSession() as session:
         ranges = await fetch_ranges(session)
 
@@ -200,12 +181,11 @@ async def build_schedule_message() -> str:
         f"Интервал: <b>{current}</b>\n"
     )
     body = parse_schedule_html(html)
-
-    # Telegram HTML: экранируем спецсимволы в body
     body = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return header + body
 
 
+# ==================== ОТПРАВКА ====================
 async def send_schedule(chat_id: int | None = None) -> None:
     target = chat_id or CHAT_ID
     if not target:
@@ -213,7 +193,6 @@ async def send_schedule(chat_id: int | None = None) -> None:
         return
     try:
         text = await build_schedule_message()
-        # Лимит 4096 символов
         for i in range(0, len(text), 4000):
             await bot.send_message(target, text[i : i + 4000], parse_mode="HTML")
     except Exception as e:
@@ -232,6 +211,7 @@ async def cmd_start(message: Message) -> None:
         f"Группа: <b>{GROUP_NAME}</b>\n\n"
         "Команды:\n"
         "/schedule — расписание на текущую неделю\n"
+        "/test — проверить, что парсер работает\n"
         "/chatid — ID этого чата",
         parse_mode="HTML",
     )
@@ -248,6 +228,120 @@ async def cmd_chatid(message: Message) -> None:
     await message.answer(f"ID чата: <code>{message.chat.id}</code>", parse_mode="HTML")
 
 
+@dp.message(Command("test"))
+async def cmd_test(message: Message) -> None:
+    """Проверка всех этапов: интервалы → скачивание → парсинг."""
+    await message.answer("🔍 Проверяю парсер...")
+
+    report = ["<b>Отчёт о проверке</b>\n"]
+
+    # 1. Интервалы
+    try:
+        async with aiohttp.ClientSession() as session:
+            ranges = await fetch_ranges(session)
+        if ranges:
+            report.append(f"✅ Интервалы получены: {len(ranges)} шт.")
+            report.append(f"   Первый: <code>{ranges[0]}</code>")
+        else:
+            report.append("❌ Интервалы не найдены (пустой список).")
+    except Exception as e:
+        report.append(f"❌ Ошибка получения интервалов: <code>{e}</code>")
+        ranges = []
+
+    if not ranges:
+        await message.answer("\n".join(report), parse_mode="HTML")
+        return
+
+    # 2. Текущий интервал
+    current = pick_current_range(ranges)
+    report.append(f"✅ Выбран интервал: <code>{current}</code>")
+
+    # 3. Скачивание HTML
+    try:
+        html = await fetch_schedule_html(current)
+        report.append(f"✅ HTML получен: {len(html)} символов")
+    except Exception as e:
+        report.append(f"❌ Ошибка скачивания: <code>{e}</code>")
+        await message.answer("\n".join(report), parse_mode="HTML")
+        return
+
+    # 4. Парсинг
+    try:
+        parsed = parse_schedule_html(html)
+        if parsed.startswith("⚠️"):
+            report.append(f"❌ {parsed}")
+        else:
+            report.append(f"✅ Расписание разобрано: {len(parsed)} символов")
+            preview = parsed[:500].replace("<", "&lt;").replace(">", "&gt;")
+            report.append(f"\n<b>Превью:</b>\n<pre>{preview}...</pre>")
+    except Exception as e:
+        report.append(f"❌ Ошибка парсинга: <code>{e}</code>")
+
+    await message.answer("\n".join(report), parse_mode="HTML")
+
+
+# ==================== САМОПРОВЕРКА БЕЗ TELEGRAM ====================
+async def run_self_test() -> None:
+    """Запускается с аргументом --test. Проверяет парсер без Telegram."""
+    print("=" * 50)
+    print("САМОПРОВЕРКА БОТА (без Telegram)")
+    print("=" * 50)
+
+    # 1. Проверка конфига
+    print("\n[1] Конфиг:")
+    print(f"    BOT_TOKEN: {'✅ задан' if BOT_TOKEN else '❌ пусто'}")
+    print(f"    CHAT_ID:   {CHAT_ID}")
+    print(f"    GROUP:     {GROUP_NAME}")
+
+    # 2. Интервалы
+    print("\n[2] Получение интервалов...")
+    try:
+        async with aiohttp.ClientSession() as session:
+            ranges = await fetch_ranges(session)
+        print(f"    ✅ Получено {len(ranges)} интервалов")
+        for r in ranges[:3]:
+            print(f"       • {r}")
+        if len(ranges) > 3:
+            print(f"       ... и ещё {len(ranges) - 3}")
+    except Exception as e:
+        print(f"    ❌ Ошибка: {e}")
+        return
+
+    if not ranges:
+        print("    ❌ Интервалы пустые")
+        return
+
+    # 3. Текущий интервал
+    current = pick_current_range(ranges)
+    print(f"\n[3] Текущий интервал: {current}")
+
+    # 4. Скачивание
+    print("\n[4] Скачивание HTML...")
+    try:
+        html = await fetch_schedule_html(current)
+        print(f"    ✅ Получено {len(html)} символов")
+    except Exception as e:
+        print(f"    ❌ Ошибка: {e}")
+        return
+
+    # 5. Парсинг
+    print("\n[5] Парсинг расписания...")
+    parsed = parse_schedule_html(html)
+    if parsed.startswith("⚠️"):
+        print(f"    ❌ {parsed}")
+        return
+    print(f"    ✅ Разобрано {len(parsed)} символов")
+    print("\n" + "=" * 50)
+    print("ПРЕВЬЮ (первые 1500 символов):")
+    print("=" * 50)
+    print(parsed[:1500])
+    if len(parsed) > 1500:
+        print(f"\n... и ещё {len(parsed) - 1500} символов")
+    print("\n" + "=" * 50)
+    print("✅ САМОПРОВЕРКА ПРОЙДЕНА")
+    print("=" * 50)
+
+
 # ==================== ЗАПУСК ====================
 async def main() -> None:
     scheduler.add_job(
@@ -255,7 +349,7 @@ async def main() -> None:
         "cron",
         hour=PARSE_HOUR,
         minute=PARSE_MINUTE,
-        day_of_week="mon-fri",  # по будням
+        day_of_week="mon-fri",
     )
     scheduler.start()
 
@@ -264,7 +358,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен")
+    if "--test" in sys.argv:
+        asyncio.run(run_self_test())
+    else:
+        try:
+            asyncio.run(main())
+        except (KeyboardInterrupt, SystemExit):
+            logging.info("Бот остановлен")
